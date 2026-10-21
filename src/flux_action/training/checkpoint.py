@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import random
 import shutil
 import warnings
@@ -57,6 +58,8 @@ from .ema import PowerEMA
 
 STATE_FORMAT = 1
 COMPLETE_MARKER = "COMPLETE"
+BEST_DIRNAME = "best"  # <root>/best: the weights of the checkpoint with the best held-out metric
+BEST_FILENAME = "best.json"
 _SINGLE_PROCESS_WARNING = "torch.distributed is disabled, unavailable or uninitialized"
 
 
@@ -193,6 +196,38 @@ def prune_checkpoints(root: str | Path, *, keep_last: int, keep_every: int | Non
             shutil.rmtree(path)
             removed.append(step)
     return removed
+
+
+def read_best(root: str | Path) -> dict[str, Any] | None:
+    """``<root>/best/best.json`` (``step``, ``metric``, ``value``) or ``None`` when no best is kept yet."""
+    path = Path(root) / BEST_DIRNAME / BEST_FILENAME
+    return json.loads(path.read_text()) if path.is_file() else None
+
+
+def keep_best(root: str | Path, checkpoint: str | Path, *, metric: str, value: float) -> Path:
+    """Hard-link a complete checkpoint's weights into ``<root>/best``, replacing the previous best.
+
+    Everything but the optimizer state and RNG is linked (model, EMAs, config, state), so it costs no space
+    while the checkpoint exists, keeps the weights after ``prune_checkpoints`` deletes it, and loads with
+    ``export_policy``. ``best`` is not a ``step-<N>`` directory, so resume and pruning never see it."""
+    root, checkpoint = Path(root), Path(checkpoint)
+    if not (checkpoint / COMPLETE_MARKER).exists():
+        raise FileNotFoundError(f"{checkpoint} is not a complete checkpoint")
+    staging, target, old = (root / f"{BEST_DIRNAME}{suffix}" for suffix in (".tmp", "", ".old"))
+    for path in (staging, old):
+        if path.exists():
+            shutil.rmtree(path)
+    skip = shutil.ignore_patterns("optimizer", "rng")
+    shutil.copytree(checkpoint, staging, copy_function=os.link, ignore=skip)
+    step = json.loads((checkpoint / "state.json").read_text())["step"]
+    record = {"step": step, "metric": metric, "value": value, "checkpoint": checkpoint.name}
+    (staging / BEST_FILENAME).write_text(json.dumps(record, indent=2) + "\n")
+    if target.exists():
+        target.rename(old)
+    staging.rename(target)
+    if old.exists():
+        shutil.rmtree(old)
+    return target
 
 
 def save_checkpoint(

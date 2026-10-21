@@ -41,8 +41,13 @@ from torch.distributed.tensor import DeviceMesh, init_device_mesh
 CHECKPOINT_WRAPPED = "_checkpoint_wrapped_module."
 
 
-def init_distributed(backend: str | None = None) -> tuple[int, int, torch.device]:
-    """``(rank, world_size, device)`` from the torchrun environment; single process without it."""
+def init_distributed(backend: str | None = None, *, force: bool = False) -> tuple[int, int, torch.device]:
+    """``(rank, world_size, device)`` from the torchrun environment; single process without it.
+
+    ``force`` initializes a process group even for one process (FSDP2 needs one, e.g. to offload a
+    single GPU's parameters, gradients and optimizer state to the CPU); without torchrun's rendezvous
+    variables it binds a free local port.
+    """
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -51,14 +56,35 @@ def init_distributed(backend: str | None = None) -> tuple[int, int, torch.device
         torch.cuda.set_device(device)
     else:
         device = torch.device("cpu")
-    if world_size > 1 and not dist.is_initialized():
+    if (world_size > 1 or force) and not dist.is_initialized():
         backend = backend or ("nccl" if device.type == "cuda" else "gloo")
         kwargs = {"device_id": device} if device.type == "cuda" else {}
+        if "MASTER_ADDR" not in os.environ:
+            if world_size > 1:
+                raise RuntimeError("multi-process training needs torchrun (MASTER_ADDR is not set)")
+            kwargs["init_method"] = f"tcp://127.0.0.1:{_free_port()}"
         # Collectives wait this long before failing (default 10 min); checkpoint writes from many ranks to
         # shared storage and slow container starts need more. FLUX_ACTION_PG_TIMEOUT_MINUTES overrides.
         timeout = timedelta(minutes=float(os.environ.get("FLUX_ACTION_PG_TIMEOUT_MINUTES", "30")))
         dist.init_process_group(backend, rank=rank, world_size=world_size, timeout=timeout, **kwargs)
     return rank, world_size, device
+
+
+def _free_port() -> int:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def all_reduce_max_flag(flag: bool, device: torch.device) -> bool:
+    """True on every rank when ``flag`` is True on any rank (a local flag without a process group)."""
+    if not (dist.is_available() and dist.is_initialized()):
+        return bool(flag)
+    tensor = torch.tensor(int(bool(flag)), device=device if device.type == "cuda" else "cpu")
+    dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
+    return bool(tensor.item())
 
 
 def rank_world() -> tuple[int, int]:
@@ -160,6 +186,7 @@ def shard_dit(
     reduce_dtype: torch.dtype = torch.float32,
     reshard_after_forward: bool = True,
     activation_checkpointing: bool = True,
+    cpu_offload: bool = False,
 ) -> nn.Module:
     """Wrap the DiT in place the way the reference trainer does: blocks, ``time_in``, then the root.
 
@@ -169,22 +196,48 @@ def shard_dit(
     feeds it in that dtype and casts the result for the modulations. The root casts nothing: the policy
     hands it streams in the compute dtype and fp32 timesteps (already on the bf16 grid, see
     ``packing.add_noise``).
+
+    ``cpu_offload`` keeps the fp32 master shards, their gradients (and so the optimizer state and the
+    EMAs) in pinned CPU memory; each group's shards visit the GPU for its forward and backward only.
+    The arithmetic is unchanged (fp32 masters, bf16 compute, fp32 reduction); the optimizer step runs on
+    the CPU. This is what fits a full fine-tune of the 7B DiT on one 96 GB GPU.
     """
+    from torch.distributed.fsdp import CPUOffloadPolicy, OffloadPolicy
+
+    offload = CPUOffloadPolicy(pin_memory=True) if cpu_offload else OffloadPolicy()
     if activation_checkpointing:
         apply_activation_checkpointing(dit)
     block_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=True
     )
     for blocks, i in dit_blocks(dit):
-        fully_shard(blocks[i], mesh=mesh, mp_policy=block_policy, reshard_after_forward=reshard_after_forward)
+        fully_shard(
+            blocks[i],
+            mesh=mesh,
+            mp_policy=block_policy,
+            reshard_after_forward=reshard_after_forward,
+            offload_policy=offload,
+        )
     time_policy = MixedPrecisionPolicy(
         param_dtype=next(dit.time_in.parameters()).dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=False
     )
-    fully_shard(dit.time_in, mesh=mesh, mp_policy=time_policy, reshard_after_forward=reshard_after_forward)
+    fully_shard(
+        dit.time_in,
+        mesh=mesh,
+        mp_policy=time_policy,
+        reshard_after_forward=reshard_after_forward,
+        offload_policy=offload,
+    )
     root_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=False
     )
-    fully_shard(dit, mesh=mesh, mp_policy=root_policy, reshard_after_forward=reshard_after_forward)
+    fully_shard(
+        dit,
+        mesh=mesh,
+        mp_policy=root_policy,
+        reshard_after_forward=reshard_after_forward,
+        offload_policy=offload,
+    )
     return dit
 
 

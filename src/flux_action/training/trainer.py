@@ -38,6 +38,7 @@ import hashlib
 import importlib
 import json
 import math
+import secrets
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -52,16 +53,26 @@ from ..data.lerobot import index as lerobot_index
 from .checkpoint import (
     TrainState,
     ema_folder,
+    keep_best,
     latest_checkpoint,
     load_checkpoint,
     prune_checkpoints,
+    read_best,
     restore_rng,
     resume_seed,
     save_checkpoint,
     seed_everything,
 )
-from .data import DataPosition, WindowDataset, build_dataloader, load_manifest, manifest_dims
+from .data import (
+    DataPosition,
+    WindowDataset,
+    build_dataloader,
+    collate_windows,
+    load_manifest,
+    manifest_dims,
+)
 from .distributed import (
+    all_reduce_max_flag,
     all_reduce_means,
     apply_activation_checkpointing,
     build_mesh,
@@ -82,6 +93,11 @@ from .schedule import (
 )
 
 PolicyFactory = Callable[[PolicyConfig], nn.Module]
+STOP_FILENAME = "STOP"  # touch <output_dir>/STOP: checkpoint after the current update and exit
+STOPPED_FILENAME = "STOPPED"  # left behind by a run that stopped on request
+WANDB_ID_FILENAME = "wandb_run_id"
+# held-out timesteps and noise come from seed + this, the same at every evaluation
+VAL_SEED_OFFSET = 1_000_003
 
 
 @dataclass
@@ -141,6 +157,11 @@ class TrainConfig:
     # step (None keeps everything, as the source run did). A checkpoint is 4x the fp32 model size.
     keep_checkpoints: int | None = None
     keep_every: int | None = 5000
+    # Also keep the weights of the checkpoint with the lowest held-out ``val/<keep_best>`` (e.g. "loss" or
+    # "sample_action_mse_normalized") in ``<output_dir>/best``, whatever pruning removes; None = off. Only
+    # checkpoints written right after an evaluation compete, so ``val_every`` should divide
+    # ``checkpoint_every``.
+    keep_best: str | None = None
     log_every: int = 10
     resume: str = "auto"  # auto | none | path of a step directory
     # A resumed run must keep windows_per_rank x ranks x grad_accumulation unless explicitly allowed.
@@ -148,12 +169,45 @@ class TrainConfig:
     # A resumed run must carry the checkpoint's run seed unless explicitly allowed (branching a new run).
     allow_seed_change: bool = False
     max_epochs: int | None = None
+    # FSDP2 CPU offload of the DiT: fp32 masters, gradients, AdamW state and the EMAs live in pinned CPU
+    # memory and each group visits the GPU for its own forward/backward; the optimizer step runs on the CPU.
+    # One process gets a process group too. Same arithmetic, a fraction of the GPU memory: this is what fits
+    # a full fine-tune of the 7B DiT (112 GB of fp32 weights, gradients and moments) on one 96 GB GPU.
+    cpu_offload: bool = False
+    # Keep the frozen text encoder (8.9 GB) on the CPU; it visits the GPU only to encode a caption that is
+    # not cached yet (once per instruction with a fixed instruction set).
+    offload_text_encoder: bool = False
+    # Held-out evaluation every ``val_every`` updates (None = off) on the index's ``val`` split, also after the
+    # last update: the flow loss of fixed windows (``val_windows_per_episode`` spread over every held-out
+    # episode, at most ``val_max_windows``) at fixed timesteps and noise, without training augmentation; and
+    # for ``val_sample_windows`` of them the sampled action chunk (the policy's sampler settings) against the
+    # recorded commands, as ``flux-action evaluate`` scores an export.
+    val_every: int | None = None
+    val_windows_per_episode: int = 2
+    val_max_windows: int | None = None
+    val_sample_windows: int = 0
+    # Weights & Biases on rank 0; None = off. The run id is stored in ``output_dir`` so that a resumed run
+    # continues the same W&B run. A W&B failure never stops training (it falls back to offline logging).
+    wandb_project: str | None = None
+    wandb_entity: str | None = None
+    wandb_run_name: str | None = None
+    wandb_mode: str = "online"  # online | offline | disabled
+    wandb_tags: tuple[str, ...] = ()
 
     def __post_init__(self):
         self.frame_hw = tuple(self.frame_hw)
         self.betas = tuple(self.betas)
         self.ema_sigma_rels = tuple(self.ema_sigma_rels)
         self.frozen_streams = tuple(self.frozen_streams)
+        self.wandb_tags = tuple(self.wandb_tags)
+        if self.val_every is not None and self.val_every < 1:
+            raise ValueError("val_every must be positive or None")
+        if self.val_windows_per_episode < 1 or self.val_sample_windows < 0:
+            raise ValueError("val_windows_per_episode must be positive and val_sample_windows non-negative")
+        if self.val_max_windows is not None and self.val_max_windows < 1:
+            raise ValueError("val_max_windows must be positive or None")
+        if self.wandb_mode not in ("online", "offline", "disabled"):
+            raise ValueError("wandb_mode must be online, offline or disabled")
         if self.steps < 1 or self.windows_per_rank < 1 or self.grad_accumulation < 1 or self.num_workers < 1:
             raise ValueError("steps, windows_per_rank, grad_accumulation and num_workers must be positive")
         if self.cooldown_start is not None and self.cooldown_start + self.cooldown_steps < self.steps:
@@ -166,6 +220,8 @@ class TrainConfig:
             self.keep_every is not None and self.keep_every < 1
         ):
             raise ValueError("keep_checkpoints and keep_every must be positive when set")
+        if self.keep_best is not None and self.val_every is None:
+            raise ValueError("keep_best needs val_every")
         if self.in_process_loader and self.num_workers != 1:
             raise ValueError("in_process_loader needs num_workers == 1")
         if self.max_grad_norm is not None and not (
@@ -203,8 +259,10 @@ class TrainConfig:
 class Trainer:
     def __init__(self, config: TrainConfig, *, policy_factory: PolicyFactory | None = None):
         self.config = config
-        self.rank, self.world_size, self.device = init_distributed()
-        self.sharded = self.world_size > 1
+        self.rank, self.world_size, self.device = init_distributed(force=config.cpu_offload)
+        if config.cpu_offload and self.device.type != "cuda":
+            raise ValueError("cpu_offload offloads a GPU's training state; it needs CUDA")
+        self.sharded = self.world_size > 1 or config.cpu_offload
         self.param_dtype = getattr(torch, config.param_dtype)
         self.compute_dtype = getattr(torch, config.compute_dtype)
         self.policy_factory = policy_factory
@@ -213,6 +271,11 @@ class Trainer:
         self.epoch_losses: list[float] = []
         self.encode_stream = torch.cuda.Stream(self.device) if self.device.type == "cuda" else None
         self._prepared: Any = None  # PreparedWindows of the next micro-batch, encoded ahead of its update
+        self._val_windows: list[dict[str, Any]] | None = None  # this rank's held-out windows, decoded once
+        self._last_val: dict[str, Any] | None = None  # the latest held-out evaluation record
+        self._wandb: Any = None
+        self._last_update_end: float | None = None
+        self._recent_walls: list[float] = []
 
     # ------------------------------------------------------------------ construction
     def build(self) -> Trainer:
@@ -270,14 +333,20 @@ class Trainer:
                 reduce_dtype=getattr(torch, cfg.reduce_dtype),
                 reshard_after_forward=cfg.reshard_after_forward,
                 activation_checkpointing=cfg.activation_checkpointing,
+                cpu_offload=cfg.cpu_offload,
             )
+            if cfg.cpu_offload:
+                policy.set_compute_device(self.device)  # the masters stay on the CPU, the compute does not
         else:
             if cfg.activation_checkpointing:
                 apply_activation_checkpointing(policy.dit)
             policy.dit.to(self.device)
-        for component in (getattr(policy.video_vae, "module", policy.video_vae), policy.text_encoder):
+        text_encoder = None if cfg.offload_text_encoder else policy.text_encoder
+        for component in (getattr(policy.video_vae, "module", policy.video_vae), text_encoder):
             if isinstance(component, nn.Module):
                 component.to(self.device)
+        if cfg.offload_text_encoder:
+            policy.set_text_encoder_offload(True)
         policy.set_compute_dtype(self.compute_dtype if self.compute_dtype != self.param_dtype else None)
         policy.train()
         self.policy = policy
@@ -501,12 +570,24 @@ class Trainer:
     # ------------------------------------------------------------------ loop
     def run(self) -> dict[str, Any]:
         self.build()
-        return self.train()
+        self._init_wandb()
+        try:
+            result = self.train()
+        except BaseException:
+            self._finish_wandb(exit_code=1)
+            raise
+        self._finish_wandb(exit_code=0)
+        return result
 
     def train(self) -> dict[str, Any]:
         cfg = self.config
         self._written = self.step if latest_checkpoint(self.output_dir) is not None and self.step > 0 else -1
-        while self.step < cfg.steps and (cfg.max_epochs is None or self.position.epoch < cfg.max_epochs):
+        self._stopped = False
+        while (
+            not self._stopped
+            and self.step < cfg.steps
+            and (cfg.max_epochs is None or self.position.epoch < cfg.max_epochs)
+        ):
             loader_kwargs = dict(
                 seed=self.state.seed,
                 epoch=self.position.epoch,
@@ -574,31 +655,51 @@ class Trainer:
                 self.position.batches_consumed = 0
         if self._written != self.step:
             self._checkpoint()
+        if self._stopped and self.rank == 0:
+            # the launcher reads STOPPED as "stopped on request, do not restart"
+            (self.output_dir / STOP_FILENAME).unlink(missing_ok=True)
+            (self.output_dir / STOPPED_FILENAME).write_text(f"{self.step}\n")
+            self._log_line({"event": "stopped", "step": self.step})
         return {
             "step": self.step,
             "epoch": self.position.epoch,
             "seed": self.state.seed,
             "output_dir": str(self.output_dir),
+            "stopped": self._stopped,
         }
 
     def _train_update(
         self, micro: list[dict[str, Any]], next_batch: dict[str, Any] | None, data_wait: float
     ) -> bool:
         """One update on ``micro`` (``next_batch`` is the following update's first batch, encoded ahead);
-        logs, checkpoints, advances the position. Returns True when the run has reached ``steps``."""
+        logs, evaluates, checkpoints, advances the position. Returns True when the run has reached ``steps``
+        or a ``STOP`` file in ``output_dir`` asked it to stop (after a checkpoint)."""
         cfg = self.config
         metrics = self._update(micro, next_batch)
         metrics["data_wait"] = data_wait
         self.position.batches_consumed += cfg.grad_accumulation
         self.step += 1
         metrics.update(step=self.step, epoch=self.position.epoch)
+        now = time.perf_counter()
+        if self._last_update_end is not None:
+            self._recent_walls = (self._recent_walls + [now - self._last_update_end])[-50:]
+            wall = sum(self._recent_walls) / len(self._recent_walls)
+            metrics.update(
+                wall_time=self._recent_walls[-1],
+                windows_per_s=metrics["windows"] / wall,
+                eta_hours=(cfg.steps - self.step) * wall / 3600,
+            )
         self.epoch_losses.append(metrics["loss"])
         if self.rank == 0 and (self.step % cfg.log_every == 0 or self.step == cfg.steps):
             self._log_line(metrics)
-        if self.step % cfg.checkpoint_every == 0 or self.step == cfg.steps:
+        if cfg.val_every is not None and (self.step % cfg.val_every == 0 or self.step == cfg.steps):
+            self._validate()
+        self._stopped = all_reduce_max_flag((self.output_dir / STOP_FILENAME).exists(), self.device)
+        if self.step % cfg.checkpoint_every == 0 or self.step == cfg.steps or self._stopped:
             self._checkpoint()
             self._written = self.step
-        return self.step >= cfg.steps
+        self._last_update_end = time.perf_counter()  # evaluation and checkpoint time stay out of the rate
+        return self.step >= cfg.steps or self._stopped
 
     def _prepare(self, batch: dict[str, Any]) -> Any:
         """``policy.prepare`` on the side stream, with an event the consumer waits for."""
@@ -731,6 +832,8 @@ class Trainer:
                     "seconds": round(time.perf_counter() - started, 1),
                 }
             )
+            if self.config.keep_best is not None:
+                self._keep_best(path)
             if self.config.keep_checkpoints is not None:
                 removed = prune_checkpoints(
                     self.output_dir,
@@ -741,6 +844,22 @@ class Trainer:
                 if removed:
                     self._log_line({"event": "prune", "removed_steps": removed})
 
+    def _keep_best(self, path: Path) -> None:
+        """Link the checkpoint just written into ``<output_dir>/best`` when this step's evaluation beats the best
+        kept so far (by ``val/<keep_best>``; a best kept under another metric is replaced)."""
+        metric, val = self.config.keep_best, self._last_val
+        if val is None or val.get("step") != self.step or metric not in val:
+            return
+        value = float(val[metric])
+        best = read_best(self.output_dir)
+        if best is not None and best["metric"] == metric and best["value"] <= value:
+            return
+        keep_best(self.output_dir, path, metric=metric, value=value)
+        previous = best["step"] if best is not None else None
+        self._log_line(
+            {"event": "best", "step": self.step, "metric": metric, "value": value, "previous": previous}
+        )
+
     def _log_line(self, record: dict[str, Any]) -> None:
         if self.rank != 0:
             return
@@ -749,6 +868,293 @@ class Trainer:
         with (self.output_dir / "metrics.jsonl").open("a") as stream:
             stream.write(line + "\n")
         print(line, flush=True)
+        self._wandb_log(record)
+
+    # ------------------------------------------------------------------ held-out evaluation
+    def _validation_windows(self) -> list[dict[str, Any]]:
+        """This rank's held-out windows: ``val_windows_per_episode`` starts spread over every ``val`` episode
+        (first caption paraphrase), decoded once and kept on the host. Every rank gets the same count, so
+        sharded forwards stay in lockstep."""
+        if self._val_windows is not None:
+            return self._val_windows
+        cfg = self.config
+        self._val_windows = []
+        if self.manifest is None or not any(e.get("split") == "val" for e in self.manifest["episodes"]):
+            self._log_line({"event": "val_skipped", "reason": "the index holds no val episodes"})
+            return self._val_windows
+        history = self.policy.config.inference_profile == "history"
+        dataset = WindowDataset(
+            self.manifest,
+            cfg.source_root,
+            self.rows_path,
+            seed=cfg.seed,
+            decoder=cfg.decoder,
+            frame_hw=cfg.frame_hw,
+            split="val",
+            n_obs_steps=self.policy.config.n_obs_steps if history else None,
+        )
+        picks = []
+        for position in range(len(dataset.episodes)):
+            starts = dataset.valid_starts(position)
+            picks.extend((position, starts[i]) for i in _spread(len(starts), cfg.val_windows_per_episode))
+        if cfg.val_max_windows is not None and len(picks) > cfg.val_max_windows:
+            picks = [picks[i] for i in _spread(len(picks), cfg.val_max_windows)]
+        per_rank = len(picks) // self.world_size
+        mine = picks[self.rank * per_rank : (self.rank + 1) * per_rank]
+        self._val_windows = [dataset.window_at(p, s) for p, s in mine]
+        self._log_line(
+            {
+                "event": "val_windows",
+                "episodes": len(dataset.episodes),
+                "windows": per_rank * self.world_size,
+                "sample_windows": min(cfg.val_sample_windows // self.world_size, per_rank) * self.world_size,
+            }
+        )
+        return self._val_windows
+
+    def _autocast(self):
+        return torch.autocast(
+            self.device.type,
+            dtype=self.compute_dtype,
+            enabled=not self.sharded
+            and self.compute_dtype != self.param_dtype
+            and self.device.type == "cuda",
+        )
+
+    @torch.no_grad()
+    def _validate(self) -> None:
+        """Held-out flow loss at fixed noise (val/loss, val/video_mse, val/action_mse) and, for the first
+        ``val_sample_windows``, the sampled action chunk scored like ``flux-action evaluate`` does. Training
+        randomness is untouched: the generators are forked and restored around it."""
+        cfg = self.config
+        windows = self._validation_windows()
+        if not windows and self.world_size == 1:
+            return
+        started = time.perf_counter()
+        policy = self.policy
+        policy.eval()
+        sums = torch.zeros(4, device=self.device, dtype=torch.float64)  # loss, video, action, windows
+        devices = [self.device] if self.device.type == "cuda" else []
+        with torch.random.fork_rng(devices=devices):
+            torch.manual_seed(cfg.seed + VAL_SEED_OFFSET)
+            for i in range(0, len(windows), cfg.windows_per_rank):
+                batch = collate_windows(windows[i : i + cfg.windows_per_rank])
+                with self._autocast():
+                    loss, info = policy(batch)
+                n = int(info["n_valid_windows"])
+                sums += torch.stack(
+                    [
+                        loss.detach().double() * n,
+                        torch.as_tensor(info["video_mse"], device=self.device, dtype=torch.float64) * n,
+                        torch.as_tensor(info["action_mse"], device=self.device, dtype=torch.float64) * n,
+                        torch.tensor(float(n), device=self.device, dtype=torch.float64),
+                    ]
+                )
+        record: dict[str, Any] = {"event": "val", "step": self.step}
+        totals = _all_reduce_sum(sums)
+        if totals[3] > 0:
+            record.update(
+                loss=totals[0] / totals[3],
+                video_mse=totals[1] / totals[3],
+                action_mse=totals[2] / totals[3],
+                windows=int(totals[3]),
+            )
+        n_sample = min(cfg.val_sample_windows // self.world_size, len(windows))
+        if n_sample > 0 and _sampling_configured(policy.config):
+            record.update(self._validate_sampling(windows[:n_sample]))
+        policy.train()
+        if self.sharded:
+            # without a backward, reshard_after_forward=False would keep every group gathered on the GPU
+            from torch.distributed.fsdp import FSDPModule
+
+            for module in policy.dit.modules():
+                if isinstance(module, FSDPModule):
+                    module.reshard()
+        record["seconds"] = round(time.perf_counter() - started, 1)
+        self._last_val = record
+        self._log_line(record)
+
+    def _validate_sampling(self, windows: list[dict[str, Any]]) -> dict[str, Any]:
+        """Sample each window's action chunk from its observation (eval inference path, the policy's sampler
+        and seed) and score it: MSE in the trained (normalized) action space and in dataset units after
+        denormalization and integration onto the preceding command, overall and per channel."""
+        policy, cfg = self.policy, self.policy.config
+        dim = cfg.action_dim
+        sums = torch.zeros(2 + dim, device=self.device, dtype=torch.float64)  # normalized, raw, raw/channel
+        for window in windows:
+            batch = collate_windows([window])
+            batch = {k: (v.to(self.device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
+            observation = {
+                **{key: batch[key][:, 0] for key in cfg.camera_order},
+                "state": batch["state"],
+                "task": batch["task"],
+            }
+            anchor = batch["state"]
+            if cfg.inference_profile == "history":
+                observation.update({key: batch[key][:, : cfg.n_obs_steps] for key in cfg.camera_order})
+                observation["command_history"] = batch["command_history"]
+                anchor = batch["command_history"][:, -1]
+            with self._autocast():
+                predicted = policy.predict_normalized_targets(observation).float()  # (1, K, D)
+            recorded = policy.training_targets(batch).to(predicted)
+            actions = policy.actions_from_targets(predicted, anchor)
+            raw = ((actions - batch["action"].float()) ** 2).mean(dim=(0, 1)).double()
+            sums += torch.cat(
+                [
+                    ((predicted - recorded) ** 2).mean().double().reshape(1),
+                    raw.mean().reshape(1),
+                    raw,
+                ]
+            )
+        totals = _all_reduce_sum(sums)
+        n = len(windows) * self.world_size
+        names = self.manifest.get("action_names") or [str(i) for i in range(dim)]
+        return {
+            "sample_windows": n,
+            "sample_action_mse_normalized": totals[0] / n,
+            "sample_action_mse_raw": totals[1] / n,
+            "sample_action_mse_raw_per_channel": {
+                name: v / n for name, v in zip(names, totals[2:], strict=True)
+            },
+        }
+
+    # ------------------------------------------------------------------ Weights & Biases
+    def _init_wandb(self) -> None:
+        cfg = self.config
+        if self.rank != 0 or cfg.wandb_project is None or cfg.wandb_mode == "disabled":
+            return
+        try:
+            import wandb
+        except ImportError:
+            self._log_line({"event": "wandb_unavailable", "reason": "pip install wandb"})
+            return
+        id_path = self.output_dir / WANDB_ID_FILENAME
+        # ``secrets``, not ``random``: the run id must not advance the training generators
+        run_id = id_path.read_text().strip() if id_path.is_file() else secrets.token_hex(4)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        id_path.write_text(run_id + "\n")
+        kwargs = dict(
+            project=cfg.wandb_project,
+            entity=cfg.wandb_entity,
+            name=cfg.wandb_run_name,
+            id=run_id,
+            resume="allow",
+            dir=str(self.output_dir),
+            tags=list(cfg.wandb_tags),
+            config={
+                **cfg.to_dict(),
+                "policy_resolved": self.policy.config.to_dict(),
+                "global_batch": cfg.global_batch(self.world_size),
+                "world_size": self.world_size,
+            },
+        )
+        for mode in dict.fromkeys((cfg.wandb_mode, "offline")):
+            try:
+                self._wandb = wandb.init(mode=mode, settings=wandb.Settings(init_timeout=120), **kwargs)
+                break
+            except Exception as error:  # no network: keep the run, log offline (wandb sync later)
+                self._log_line({"event": "wandb_init_failed", "mode": mode, "error": repr(error)[:300]})
+        if self._wandb is None:
+            return
+        try:
+            # Every series is plotted against the optimizer update, so a resumed run (which repeats the
+            # updates after its last checkpoint) continues the same curves instead of fighting W&B's step.
+            self._wandb.define_metric("train/step")
+            self._wandb.define_metric("*", step_metric="train/step")
+        except Exception as error:
+            self._log_line({"event": "wandb_define_metric_failed", "error": repr(error)[:300]})
+        self._log_line({"event": "wandb", "run_id": run_id, "mode": mode, "url": _wandb_url(self._wandb)})
+
+    def _wandb_log(self, record: dict[str, Any]) -> None:
+        if self._wandb is None:
+            return
+        data = wandb_payload(record)
+        if data is None:
+            return
+        try:
+            self._wandb.log(data)
+        except Exception as error:  # never let logging stop a run
+            print(json.dumps({"event": "wandb_log_failed", "error": repr(error)[:300]}), flush=True)
+
+    def _finish_wandb(self, exit_code: int) -> None:
+        if self._wandb is None:
+            return
+        try:
+            self._wandb.finish(exit_code=exit_code)
+        except Exception:
+            pass
+        self._wandb = None
+
+
+def wandb_kind(record: dict[str, Any]) -> str | None:
+    """Which W&B series a ``metrics.jsonl`` record feeds: ``train``, ``val``, ``checkpoint`` or none."""
+    event = record.get("event")
+    if event is None and "loss" in record:
+        return "train"
+    if event in ("val", "checkpoint"):
+        return event
+    return None
+
+
+def wandb_payload(record: dict[str, Any]) -> dict[str, Any] | None:
+    """A ``metrics.jsonl`` record as W&B data keyed ``train/*`` or ``val/*``, plotted against ``train/step``.
+
+    Shared by the in-process logger and ``scripts/astribot/wandb_sync.py`` (which uploads the file from a
+    separate process, so network trouble never reaches training)."""
+    kind = wandb_kind(record)
+    if kind is None:
+        return None
+    if kind == "checkpoint":
+        record = {"step": record["step"], "checkpoint_seconds": record["seconds"]}
+    prefix = "val" if kind == "val" else "train"
+    data: dict[str, Any] = {"train/step": record["step"]}
+    for key, value in record.items():
+        if key in ("event", "step", "time"):
+            continue
+        if isinstance(value, dict):
+            data.update({f"{prefix}/{key}/{k}": v for k, v in value.items() if _is_number(v)})
+        elif _is_number(value):
+            data[f"{prefix}/{key}"] = value
+    return data
+
+
+def _spread(n: int, k: int) -> list[int]:
+    """``k`` indices spread evenly over ``range(n)``, first and last included (``inference.evaluate.spread``)."""
+    if n <= 0 or k <= 0:
+        return []
+    if k == 1 or n == 1:
+        return [0]
+    return sorted({round(j * (n - 1) / (k - 1)) for j in range(k)})
+
+
+def _all_reduce_sum(values: torch.Tensor) -> list[float]:
+    import torch.distributed as dist
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    return values.tolist()
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _sampling_configured(config: PolicyConfig) -> bool:
+    try:
+        config.validate_inference()
+    except AssertionError:
+        return False
+    return True
+
+
+def _wandb_url(run: Any) -> str | None:
+    try:
+        return run.url  # wandb >= 0.19; older releases have get_url()
+    except Exception:
+        try:
+            return run.get_url()
+        except Exception:
+            return None
 
 
 def _default_policy(config: PolicyConfig) -> nn.Module:

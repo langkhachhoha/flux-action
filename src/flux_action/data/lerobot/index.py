@@ -116,10 +116,12 @@ def major_version(info: dict) -> int:
 
 def feature_names(feature: dict, dim: int) -> list[str] | None:
     """``names`` of a 1-D feature: a list of ``dim`` names, or the single list some datasets nest under one
-    key (``{"motors": [...]}``); anything else is unnamed."""
+    key (``{"motors": [...]}``) or inside a one-element list (``[[...]]``); anything else is unnamed."""
     names = feature.get("names")
     if isinstance(names, dict) and len(names) == 1:
         names = next(iter(names.values()))
+    if isinstance(names, list) and len(names) == 1 and isinstance(names[0], list):
+        names = names[0]
     if isinstance(names, list) and len(names) == dim and all(isinstance(n, str) for n in names):
         return list(names)
     return None

@@ -8,3 +8,8 @@ outputs/
 *.safetensors
 *.pt
 .DS_Store
+checkpoints/
+checkpoint/
+wandb/
+*.distcp
+*.ckpt

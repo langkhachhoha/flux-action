@@ -330,7 +330,14 @@ class FluxActionPolicy(nn.Module):
 
     @property
     def device(self) -> torch.device:
-        return next(self.dit.parameters()).device
+        """The compute device: the DiT's, unless :meth:`set_compute_device` pinned another one."""
+        pinned = self.__dict__.get("_compute_device")
+        return pinned if pinned is not None else next(self.dit.parameters()).device
+
+    def set_compute_device(self, device: torch.device | None) -> None:
+        """Run encoders and DiT inputs on ``device`` although the DiT's master parameters live elsewhere
+        (FSDP2 CPU offload keeps them on the CPU and moves each group to the GPU for its own compute)."""
+        self.__dict__["_compute_device"] = None if device is None else torch.device(device)
 
     def freeze_streams(self, streams: tuple[str, ...]) -> list[str]:
         """Exclude whole content streams from training (``requires_grad=False``); returns their parameter names.
