@@ -36,7 +36,7 @@ See [checkpoint selection](docs/setup.md#choose-a-checkpoint) for commands.
 ## Get started
 
 | Guide | What you’ll do |
-|---|---|
+|---|----|
 | [Setup & inference](docs/setup.md) | Install dependencies, download weights and predict actions with DROID or SO-101 |
 | [DROID full fine-tuning](docs/droid-finetune.md) | Prepare DROID data, run the reproduction recipe, resume and export |
 | [SO-101 LoRA](docs/so101-lora.md) | Adapt the prepared SO-101 checkpoint to your task with LeRobot |
