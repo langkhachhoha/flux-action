@@ -1,0 +1,32 @@
+# Astribot S1 topics as the ROS1->ROS2 bridge (vm_astribot/run_bridge.sh) exposes them on ROS_DOMAIN_ID 25.
+# Same values as vmo_diffusion_policy_vla/diffusion_policy/config/real_world/astribot_s1_ros2.yaml.
+# Camera keys are the export's camera keys without "images." (images.head -> head).
+cameras:
+  head: /astribot_camera/head_rgbd/color_compress/compressed
+  left_wrist: /astribot_camera/left_wrist_rgbd/color_compress/compressed
+  right_wrist: /astribot_camera/right_wrist_rgbd/color_compress/compressed
+
+states:
+  torso: /astribot_torso/joint_space_states
+  left_arm: /astribot_arm_left/joint_space_states
+  right_arm: /astribot_arm_right/joint_space_states
+  left_gripper: /astribot_gripper_left/joint_space_states
+  right_gripper: /astribot_gripper_right/joint_space_states
+  head: /astribot_head/joint_space_states
+
+commands:
+  torso: /astribot_torso/joint_space_command
+  left_arm: /astribot_arm_left/joint_space_command
+  right_arm: /astribot_arm_right/joint_space_command
+  left_gripper: /astribot_gripper_left/joint_space_command
+  right_gripper: /astribot_gripper_right/joint_space_command
+  head: /astribot_head/joint_space_command
+
+# Inference starts only after all six body parts have reported a state (VMO runtime readiness gate).
+required_state_parts: [torso, left_arm, right_arm, left_gripper, right_gripper, head]
+
+# Policy targets change at 30 Hz; arms are streamed at 250 Hz with a per-tick velocity limit (LeRobot S1
+# daemon); grippers are sent only when their target changes.
+command_stream:
+  publish_hz: 250.0
+  arm_velocity_limit: 8.0

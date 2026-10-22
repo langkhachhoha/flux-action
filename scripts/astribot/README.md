@@ -123,6 +123,189 @@ Script tạo package inference bf16 tại `<output_dir>/export/...`, đọc đư
 tick 30 Hz, đưa vào `images.head`, `images.left_wrist`, `images.right_wrist` (uint8, 360×640) và `state`
 (16 giá trị cùng thứ tự và đơn vị với dataset), rồi gọi `policy.reset()` khi bắt đầu episode mới.
 
+## Chạy trên robot Astribot S1 (ROS 2)
+
+Toàn bộ phần chạy robot nằm trong `scripts/astribot/` của repo này, không cần `vmo_diffusion_policy_vla`.
+ROS 2 Humble chỉ có `rclpy` cho Python 3.10, còn model cần Python 3.12, nên có 2 tiến trình nói chuyện qua
+`127.0.0.1:5555` (chỉ trong máy, không pickle):
+
+```text
+Robot (ROS 1) ── bridge vm_astribot/run_bridge.sh ── ROS 2, ROS_DOMAIN_ID=25
+      camera + joint state ▼                         ▲ lệnh khớp (chỉ khi --execute)
+robot_client.py   Python 3.10 hệ thống (/usr/bin/python3): vòng 30 Hz, lịch sử 8 tick, limiter,
+                  tracking guard, tư thế sẵn sàng, tự dừng khi mất cảm biến, ghi log episode,
+                  quay video, phím h để về HOME
+      cửa sổ 8 tick ▼                                ▲ chunk 42 action tuyệt đối
+policy_server.py  .venv Python 3.12, GPU: FLUX 3 Action 7B bf16 + video VAE + Qwen3-VL
+```
+
+| File | Vai trò |
+|---|---|
+| `serve_policy.sh` → `policy_server.py` | giữ model trên GPU; nhận `seed` theo từng request |
+| `run_robot.sh` → `robot_client.py` | client ROS 2 (source `ros2_env.sh`: ROS 2, Fast-DDS UDP, `astribot_msgs`) |
+| `robot_runtime.py` | phần không phụ thuộc ROS: hợp đồng dữ liệu, lịch sử, limiter, tracking, kiểm tra định dạng |
+| `robot_ros2.py` | node ROS 2: đọc camera/khớp, luồng lệnh tay 250 Hz, tư thế sẵn sàng/HOME, lệnh giữ, timer quay video |
+| `robot_video.py` | quay video thời gian thực: từng camera + `grid.mp4` có bảng trạng thái (port `AstribotVideoRecorder` của vmo) |
+| `move_home.sh` → `move_home.py` | đưa robot về HOME (hoặc tư thế sẵn sàng) thật mượt, có `--dry-run` (port `move_astribot_home.sh` của vmo) |
+| `robot_log.py`, `replay_log.py` | ghi log episode và `console.log`; phát lại log qua model, so cảnh với dữ liệu train |
+| `fake_robot.py`, `test_fake_robot.sh` | robot giả phát lại 1 episode held-out (domain 77, chỉ localhost) |
+| `ros2_astribot.yaml`, `fastdds_udp.xml` | topic và cấu hình DDS (giống `vmo_diffusion_policy_vla`) |
+| `astribot_wire.py` | giao thức socket (cùng định dạng với client cũ của vmo, client cũ vẫn dùng được) |
+
+Python hệ thống 3.10 đã có sẵn numpy, OpenCV, PyYAML (đi kèm ROS Humble), không cần cài thêm gì.
+
+### Hợp đồng dữ liệu (đã kiểm tra trên dataset)
+
+| Mục | Giá trị |
+|---|---|
+| State / action | 16 số `arm_left_j0..6, arm_right_j0..6, gripper_left, gripper_right`; tay tính bằng radian, action là vị trí tuyệt đối (≈ state của tick sau) |
+| Gripper | state = vị trí ngón đo được (~0 mở, 35–42 khi kẹp vật); action = lệnh 0 (mở) … 100 (đóng) |
+| Camera | `images.head`, `images.left_wrist`, `images.right_wrist`: RGB uint8 360×640 (16:9). Robot gửi JPEG, head 1280×720 và wrist 640×360, client thu nhỏ bằng `INTER_AREA` |
+| Lịch sử | tick `t` ghi state và ảnh của `t` cùng lệnh đã gửi trước `t`; tick đầu lặp 8 lần. Sau tư thế sẵn sàng, "lệnh trước đó" là chính tư thế sẵn sàng (lệnh đã gửi thật). Dry-run không gửi lệnh nên dùng state đo được thay lệnh (như `select_action`); gripper đang kẹp vật thì giá trị này (~37) khác thang lệnh (100), nên chỉ dry-run khi gripper đang mở |
+| Đầu ra | 42 action, robot chạy 32 rồi dự đoán lại; server cộng dồn delta của tay lên lệnh cuối |
+
+Client tự kiểm tra lúc khởi động: tỉ lệ 16:9 của từng camera, state đo được so với khoảng q01..q99 lúc train
+(lệch quá 1 khoảng thì từ chối `--execute`, dấu hiệu sai đơn vị hoặc sai thứ tự khớp), metadata của server
+(16 chiều, 360×640, đúng thứ tự tên khớp). `tests/test_astribot_runtime.py` kiểm tra lịch sử khớp bit-exact với
+`ObservationHistory` của flux.
+
+### Kết quả trên tập held-out (20 episode, `step-2300-model-bf16`, 4 bước × guidance 3)
+
+| Pha (140 cửa sổ) | Chuyển động tay dự đoán / thật (32 bước) | RMSE model / đứng yên | Model tốt hơn đứng yên |
+|---|---|---|---|
+| đang làm việc (80) | 0.246 / 0.301 rad | 0.047 / 0.078 rad | 78% |
+| vừa bắt đầu chuyển động (20) | 0.193 / 0.511 rad | 0.121 / 0.129 rad | 55% |
+| 16 frame trước khi người điều khiển bắt đầu (20) | 0.014 / 0.280 rad | 0.054 / 0.050 rad | 5% |
+| frame đầu, robot đứng yên (20) | 0.014 / 0.025 rad | 0.014 / 0.005 rad | 0% |
+
+Khi đang làm việc model tốt (sai số giảm 40%). Nhưng **model không tự bắt đầu**: mọi episode train đều đứng yên
+~1.6 s (trung vị 49 frame) trước khi người điều khiển bắt đầu, không có dấu hiệu nào trong ảnh, nên với lịch sử
+đứng yên model dự đoán gần như đứng yên. Mô phỏng vòng kín với ảnh tĩnh tái hiện đúng lần chạy robot ngày
+2026-10-21 (0.010–0.013 rad mỗi chu kỳ, robot gần như đứng im 33 chu kỳ): với **seed cố định** cùng đầu vào cho
+cùng đầu ra nên model mắc kẹt; với seed đổi mỗi chu kỳ có chu kỳ bật lên 0.14–0.27 rad. Vì vậy client mặc định
+`--seed-mode cycle` (seed = `--seed` + số thứ tự chu kỳ).
+
+Lần chạy đó cảnh cũng khác dữ liệu train: robot đứng xa bàn hơn (bàn nhỏ hơn trong camera đầu, mép bàn gần đáy
+ảnh cổ tay, bình rót ở mép phải thay vì trước gripper phải). Với ảnh robot model còn dè dặt hơn (0.015–0.028 rad
+so với 0.011–0.157 rad với ảnh dataset ở cùng tư thế). Đặt robot và bàn giống lúc thu dữ liệu rồi kiểm tra bằng
+`scene.jpg` (bước B).
+
+Nếu sau khi đặt đúng cảnh mà robot vẫn không khởi động: cách sửa gốc là train lại với đoạn đứng yên đầu episode
+được cắt bớt (cửa sổ train bắt đầu từ ~8 frame trước khi tay chuyển động), để model học "đứng yên thì bắt đầu".
+
+### Các bước
+
+```bash
+cd ~/projects/flux-action   # /nvme/hieuhm19/projects/flux-action
+```
+
+**A. Policy server** (tmux `server`, giữ chạy suốt buổi; cần ~25 GB GPU trống lúc bật, ~18–24 GB khi chạy):
+
+```bash
+CUDA_DEVICE=cuda:0 bash scripts/astribot/serve_policy.sh checkpoint/infer/step-2300-model-bf16
+# đợi: "Policy server listening on 127.0.0.1:5555"
+```
+
+Chế độ nhanh (~1.1 s thay vì ~4.2 s mỗi lần dự đoán; offline không kém hơn):
+thêm `--num-inference-steps 2 --guidance-scale 1.0`.
+
+**B. Dry-run và kiểm tra cảnh** (bridge đang chạy, robot không di chuyển):
+
+```bash
+bash scripts/astribot/run_robot.sh --max-cycles 3
+.venv/bin/python scripts/astribot/replay_log.py --no-model --log ~/Desktop/astribot_logs/flux_action/<thư mục mới nhất>
+```
+
+Trong log phải có `State check: every value lies within the training range.`, 3 camera không có
+`WARNING: aspect`, 3 dòng `cycle=...`. Mở `scene.jpg`: hàng trên là robot, hai hàng dưới là các episode
+held-out bắt đầu gần tư thế đó nhất; bàn, cốc, khay, bình và góc nhìn cổ tay phải trông giống nhau.
+
+**C. Chạy thật, tăng dần** (người đứng cạnh, tay ở nút E-stop):
+
+```bash
+bash scripts/astribot/run_robot.sh --execute --prepare-ready-pose --execute-steps 8 --max-cycles 1
+bash scripts/astribot/run_robot.sh --execute --prepare-ready-pose --max-cycles 3
+bash scripts/astribot/run_robot.sh --execute --prepare-ready-pose            # Ctrl-C để dừng
+```
+
+Chương trình hỏi `Enter 's' ...` trước khi gửi lệnh đầu tiên. Mỗi chu kỳ in
+`cycle=... seed=... first_step=...rad chunk_arm_motion=...rad grippers=[...]->[...]`; `WARNING`/`CRITICAL
+tracking lag` khi robot bám lệnh chậm (3 lần CRITICAL liên tiếp thì tự dừng); `stale Astribot input(s)` khi
+camera hoặc khớp ngừng gửi (tự dừng). Khi kết thúc hay lỗi, client gửi lệnh giữ vị trí đã gửi gần nhất.
+
+**Nút về HOME (`h`):** đang chạy thì gõ `h` rồi Enter. Policy dừng ngay, robot giữ lệnh cuối cùng, và client in
+bảng kế hoạch (mỗi bộ phận sẽ quay bao nhiêu độ). Gõ `h` + Enter lần nữa thì robot về HOME, chuyển động
+cosine trong `--home-duration` giây (mặc định 4 s, giống vmo). Gõ thứ khác thì robot đứng giữ và chương trình
+kết thúc. Có `--yes` thì robot về HOME ngay sau lần `h` đầu tiên. Chuyển động bắt đầu từ lệnh đã gửi gần nhất,
+không phải từ vị trí đo được, nên tay không bị giật. HOME **mở cả 2 gripper**: nếu robot đang cầm cốc thì lấy
+cốc ra trước khi xác nhận. Ở dry-run, `h` chỉ dừng và in bảng, robot không di chuyển.
+
+**D. Về HOME sau khi đã dừng** (`run_robot.sh` đã thoát; không bao giờ để 2 chương trình cùng gửi lệnh):
+
+```bash
+bash scripts/astribot/move_home.sh --dry-run        # chỉ in bảng kế hoạch, robot không di chuyển
+bash scripts/astribot/move_home.sh                  # hỏi 's' rồi về HOME trong 4 s
+bash scripts/astribot/move_home.sh --duration 8     # chậm hơn, khi có khớp phải quay hơn ~30°
+bash scripts/astribot/move_home.sh --pose ready     # về tư thế sẵn sàng thay vì HOME
+```
+
+**E. Xem lại một lần chạy** (GPU rảnh, server có thể vẫn chạy trên GPU khác):
+
+```bash
+.venv/bin/python scripts/astribot/replay_log.py --log ~/Desktop/astribot_logs/flux_action/<run>     --device cuda:1 --seeds 0,1,2,3
+```
+
+Với seed đã ghi, replay phải ra đúng chunk của robot (`|replay-logged|max=0.0000rad`); cột `seedN` cho biết
+chuyển động phụ thuộc vào nhiễu lấy mẫu đến mức nào.
+
+Mỗi lần chạy có một thư mục `~/Desktop/astribot_logs/flux_action/<thời gian>_<execute|dry>/` (in ra ở dòng
+`Run directory:`):
+
+| File | Nội dung |
+|---|---|
+| `video/grid.mp4` | video thời gian thực 1280×720: camera đầu, bảng trạng thái (mode, pha, chu kỳ, chunk motion, gripper, thời gian), 2 camera cổ tay |
+| `video/<camera>.mp4`, `video/session_info.json` | từng camera 640×360 (H.264, 30 fps); thời lượng, số frame, số frame bị bỏ |
+| `console.log` | bản sao mọi dòng client in ra, kể cả traceback khi lỗi (không cần `\| tee` nữa) |
+| `images.*.mp4`, `ticks.npz`, `cycles.npz`, `windows/`, `meta.json` | log episode để replay (~5 MB mỗi lần dự đoán): mỗi tick một frame, state, lệnh, chunk, seed, ảnh request không nén |
+
+Video quay từ lúc gõ `s` (dry-run: ngay khi sẵn sàng) tới khi chương trình dừng, gồm cả lúc về tư thế sẵn sàng,
+lúc chờ server và lúc về HOME. Video lấy frame bằng timer riêng, nên không bị đứng hình trong ~1.1 s server
+lấy mẫu, khác với `images.*.mp4` (chỉ có frame ở các tick điều khiển). Khi máy mã hoá không kịp, video bỏ bớt
+frame (con số nằm trong `session_info.json`), còn vòng điều khiển không bị ảnh hưởng.
+
+### Test không cần robot
+
+```bash
+.venv/bin/python -m pytest -q tests/test_astribot_runtime.py                                     # .venv
+/usr/bin/python3 -m pytest -q -p no:cacheprovider --noconftest tests/test_astribot_runtime.py   # Python của ROS
+bash scripts/astribot/test_fake_robot.sh --max-cycles 3                                          # dry-run, robot giả
+FAKE_EXECUTE=1 bash scripts/astribot/test_fake_robot.sh --prepare-ready-pose --max-cycles 3      # nhánh --execute
+(sleep 30; echo h) | FAKE_EXECUTE=1 bash scripts/astribot/test_fake_robot.sh --prepare-ready-pose  # phím h -> HOME
+.venv/bin/python scripts/astribot/evaluate_export.py --checkpoint checkpoint/infer/step-2300-model-bf16 \
+    --device cuda:1                                                                             # 20 episode held-out
+```
+
+Robot giả phát lại episode held-out 376 (bắt đầu ở tư thế sẵn sàng) trên `ROS_DOMAIN_ID=77`, chỉ localhost, và
+từ chối chạy ở domain 25. Với `FAKE_EXECUTE=1` nó bám lệnh hoàn hảo; cuối test in số lệnh và bước lớn nhất
+của mỗi khớp (tay ≤ 0.032 rad ở 250 Hz, gripper ≤ 20 mỗi tick).
+
+### Tham số `robot_client.py`
+
+| Tham số | Ý nghĩa |
+|---|---|
+| `--execute` | gửi lệnh thật (không có thì dry-run) |
+| `--prepare-ready-pose` | đưa thân/đầu/tay/gripper về tư thế sẵn sàng trước (cần `--execute`) |
+| `--execute-steps N` | số action chạy mỗi lần dự đoán (1–32, mặc định 32) |
+| `--max-cycles N` | dừng sau N lần dự đoán |
+| `--seed-mode cycle\|fixed`, `--seed S` | seed lấy mẫu: đổi mỗi chu kỳ (mặc định) hoặc cố định như export |
+| `--server HOST:PORT` | mặc định `127.0.0.1:5555` (server đổi cổng bằng `PORT=...`) |
+| `--max-joint-delta`, `--max-gripper-delta` | giới hạn bước mỗi tick (0.15 rad, 20) |
+| `--tracking-critical-limit N` | dừng sau N mẫu CRITICAL liên tiếp (mặc định 3) |
+| `--allow-out-of-range-state` | cho `--execute` dù state lệch xa khoảng train (chỉ sau khi đã kiểm tra) |
+| `--home-duration S` | thời gian về HOME sau phím `h` (mặc định 4 s) |
+| `--no-record`, `--no-record-grid`, `--record-fps` | tắt video / chỉ quay từng camera, không có grid / fps của video (mặc định 30) |
+| `--log-dir`, `--no-log`, `--no-log-windows` | thư mục chứa các lần chạy (mặc định `~/Desktop/astribot_logs/flux_action`); tắt log episode; bỏ ảnh request không nén |
+
 ## Thay đổi trong code
 
 Mọi tính năng mới đều mặc định tắt, nên các config DROID/SO-101 gốc chạy y như cũ (210 test gốc pass,
